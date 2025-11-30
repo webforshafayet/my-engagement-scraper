@@ -1,0 +1,167 @@
+from flask import Flask, render_template, request
+from playwright.sync_api import sync_playwright
+import re
+
+app = Flask(__name__)
+
+
+def parse_num(raw: str) -> int:
+    """
+    Convert '803', '2.3K', '1.1M' → int.
+    """
+    raw = raw.strip().replace(",", "").lower()
+    m = re.match(r"^([0-9]*\.?[0-9]+)\s*([km])?$", raw)
+    if not m:
+        digits = re.sub(r"[^0-9]", "", raw)
+        return int(digits) if digits else 0
+
+    num = float(m.group(1))
+    suffix = m.group(2)
+
+    if suffix == "k":
+        num *= 1_000
+    elif suffix == "m":
+        num *= 1_000_000
+
+    return int(num)
+
+
+def parse_engagement_from_text(text: str) -> dict:
+    """
+    Given the rendered text, extract reactions, comments, shares.
+
+    Strategy:
+    - First: find numbers near "All reactions:" (in the small toolbar).
+    - Ignore any insane number (likely page likes/followers).
+    - Fallback to generic "X comments", "Y shares".
+    """
+    likes = comments = shares = 0
+
+    # --- 1. Primary: numbers near "All reactions:" ---
+    m = re.search(r"All reactions:(.{0,200})", text)
+    if m:
+        chunk = m.group(1)
+
+        # numeric tokens in order
+        ordered_nums = []
+        for nm in re.finditer(r"[0-9][0-9.,KkMm]*", chunk):
+            raw_num = nm.group(0)
+            val = parse_num(raw_num)
+            # ignore crazy-big numbers (page likes)
+            if val < 1_000_000:
+                ordered_nums.append(val)
+
+        if len(ordered_nums) >= 1:
+            likes = ordered_nums[0]
+        if len(ordered_nums) >= 2:
+            comments = ordered_nums[1]
+        if len(ordered_nums) >= 3:
+            shares = ordered_nums[2]
+
+    # --- 2. Fallbacks (just in case layout is different) ---
+    if likes == 0:
+        m = re.search(r"All reactions:\s*([0-9.,KkMm]+)", text)
+        if m:
+            likes = parse_num(m.group(1))
+
+    if comments == 0:
+        m = re.search(r"([0-9.,KkMm]+)\s+comments?", text, re.IGNORECASE)
+        if m:
+            comments = parse_num(m.group(1))
+
+    if shares == 0:
+        m = re.search(r"([0-9.,KkMm]+)\s+shares?", text, re.IGNORECASE)
+        if m:
+            shares = parse_num(m.group(1))
+
+    total = likes + comments + shares
+
+    return {
+        "likes": likes,
+        "comments": comments,
+        "shares": shares,
+        "total": total,
+    }
+
+
+def scrape_post(url: str) -> dict:
+    """
+    Open the Facebook URL in headless Chromium (Playwright),
+    grab the reactions toolbar text + full page text, then parse.
+    """
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            context = browser.new_context(
+                user_agent=(
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/131.0 Safari/537.36"
+                ),
+                locale="en-US",
+            )
+            page = context.new_page()
+            page.goto(url, wait_until="networkidle", timeout=45000)
+            page.wait_for_timeout(3000)
+
+            # 1) Try to grab ONLY the reactions toolbar area
+            reactions_text = ""
+            try:
+                toolbar = page.locator("span[aria-label*='See who reacted']").first
+                if toolbar.count() > 0:
+                    reactions_text = toolbar.inner_text() or ""
+            except Exception:
+                reactions_text = ""
+
+            # 2) Full body text as backup (for comments/shares fallbacks)
+            body_text = page.text_content("body") or ""
+
+            browser.close()
+    except Exception as e:
+        return {
+            "likes": 0,
+            "comments": 0,
+            "shares": 0,
+            "total": 0,
+            "status": f"Browser error: {e}",
+        }
+
+    # Combine toolbar text (which is small & clean) with full text.
+    combined_text = reactions_text + "\n" + body_text
+
+    data = parse_engagement_from_text(combined_text)
+
+    if data["total"] == 0:
+        data["status"] = "Could not detect engagement"
+    else:
+        data["status"] = "OK"
+
+    return data
+
+
+@app.route("/", methods=["GET", "POST"])
+def index():
+    results = []
+    grand_total = 0
+
+    if request.method == "POST":
+        raw_urls = request.form.get("urls", "")
+        urls = [u.strip() for u in raw_urls.splitlines() if u.strip()]
+
+        for url in urls:
+            engagement = scrape_post(url)
+            results.append({
+                "url": url,
+                "likes": engagement["likes"],
+                "comments": engagement["comments"],
+                "shares": engagement["shares"],
+                "total": engagement["total"],
+                "status": engagement["status"],
+            })
+            grand_total += engagement["total"]
+
+    return render_template("index.html", results=results, grand_total=grand_total)
+
+
+if __name__ == "__main__":
+    app.run(debug=True)
